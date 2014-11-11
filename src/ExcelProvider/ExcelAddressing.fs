@@ -103,7 +103,7 @@ let getRangeView (workbook : DataSet) range =
             topLeft, bottomRight, sheet
         | Unbounded (topLeft) ->
             let sheet = workbook.Tables.[topLeft.Sheet]
-            topLeft, {topLeft with Row = sheet.Rows.Count; Column = sheet.Columns.Count - 1}, sheet
+            topLeft, {topLeft with Row = sheet.Rows.Count - 1; Column = sheet.Columns.Count - 1}, sheet
 
     { StartColumn = topLeft.Column; StartRow = topLeft.Row; EndColumn = bottomRight.Column; EndRow = bottomRight.Row; Sheet = sheet }
 

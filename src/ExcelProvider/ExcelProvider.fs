@@ -12,16 +12,17 @@ open Microsoft.FSharp.Core.CompilerServices
 open Samples.FSharp.ProvidedTypes
 
 // Represents a row in a provided ExcelFileInternal
-type Row(rowIndex, getCellValue: int -> int -> obj, columns: Map<string, int>) =
+type Row(rowIndex, getCellValue: int -> int -> obj, columns: Map<string, array<int>>) =
     member this.GetValue columnIndex = getCellValue rowIndex columnIndex
 
     override this.ToString() =
         let columnValueList =
             [for column in columns do
-                let value = getCellValue rowIndex column.Value
+                yield column.Value |> Seq.map (fun index ->
+                    let value = getCellValue rowIndex index
                 let columnName, value = column.Key, string value
-                yield sprintf "\t%s = %s" columnName value]
-            |> String.concat Environment.NewLine
+                    sprintf "\t%s = %s" columnName value)]
+            |> Seq.concat |> String.concat Environment.NewLine
 
         sprintf "Row %d%s%s" rowIndex Environment.NewLine columnValueList
 
@@ -41,45 +42,56 @@ let private emptyListOrFail func items =
 
 
 // get the type, and implementation of a getter property based on a template value
-let internal propertyImplementation columnIndex (value : obj) =
+let internal propertyImplementation (columnSeq : seq<int>) (value : obj) =
+    match Seq.length columnSeq with
+    | 1 ->
+        let columnIndex = Seq.head columnSeq
     match value with
-    | :? float -> typeof<double>, (fun row -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> (v :?> Nullable<double>).GetValueOrDefault()) @@>) |> singleItemOrFail
-    | :? bool -> typeof<bool>, (fun row -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> (v :?> Nullable<bool>).GetValueOrDefault()) @@>) |> singleItemOrFail
-    | :? DateTime -> typeof<DateTime>, (fun row -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> (v :?> Nullable<DateTime>).GetValueOrDefault()) @@>) |> singleItemOrFail
-    | :? string -> typeof<string>, (fun row -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> v :?> string) @@>) |> singleItemOrFail
-    | _ -> typeof<obj>, (fun row -> <@@ (%%row: Row).GetValue columnIndex @@>) |> singleItemOrFail
+        | :? float -> typeof<double>, (fun [row] -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> v :?> double) @@>)
+        | :? bool -> typeof<bool>, (fun [row] -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> v :?> bool) @@>)
+        | :? DateTime -> typeof<DateTime>, (fun [row] -> <@@ (%%row: Row).GetValue columnIndex |> (fun v -> v :?> DateTime) @@>)
+        | :? string -> typeof<string>, (fun [row] -> <@@ (%%row: Row).GetValue columnIndex |> (function 
+                                                                                                | :? DBNull -> null
+                                                                                                | v -> string v) @@>)
+        | _ -> typeof<obj>, (fun [row] -> <@@ (%%row: Row).GetValue columnIndex @@>)
+
+    | _ ->
+         match value with
+        | :? float -> typeof<float seq>, (fun [row] -> <@@ columnSeq |> Seq.map (fun columnIndex -> (%%row: Row).GetValue columnIndex |> (fun v -> v :?> double)) @@>)
+        | :? bool -> typeof<bool seq>, (fun [row] -> <@@ columnSeq |> Seq.map (fun columnIndex -> (%%row: Row).GetValue columnIndex |> (fun v -> v :?> bool)) @@>)
+        | :? DateTime -> typeof<DateTime seq>, (fun [row] -> <@@ columnSeq |> Seq.map (fun columnIndex -> (%%row: Row).GetValue columnIndex |> (fun v -> v :?> DateTime)) @@>)
+        | :? string -> typeof<string seq>, (fun [row] -> <@@ columnSeq |> Seq.map (fun columnIndex -> (%%row: Row).GetValue columnIndex |> (function 
+                                                                                                | :? DBNull -> null
+                                                                                                | v -> string v)) @@>)
+        | _ -> typeof<obj seq>, (fun [row] -> <@@ columnSeq |> Seq.map (fun columnIndex -> (%%row: Row).GetValue columnIndex) @@>)
 
 // gets a list of column definition information for the columns in a view
 let internal getColumnDefinitions (data : View) forcestring =
     let getCell = getCellValue data
+    
     [for columnIndex in 0 .. data.ColumnMappings.Count - 1 do
         let columnName = getCell 0 columnIndex |> string
         if not (String.IsNullOrWhiteSpace(columnName)) then
-            let cellType, getter =
-                if forcestring then
-                    let getter = (fun row ->
-                                    <@@
-                                        let value = (%%row: Row).GetValue columnIndex |> string
-                                        if String.IsNullOrEmpty value then null
-                                        else value
-                                    @@>) |> singleItemOrFail
-                    typedefof<string>, getter
-                else
-                    let cellValue = getCell 1 columnIndex
-                    propertyImplementation columnIndex cellValue
-            yield (columnName, (columnIndex, cellType, getter))]
+            yield (columnName, columnIndex)]
+    |> Seq.groupBy fst 
+    |> Seq.map (fun (columnName, group) -> 
+        let columnSeq = group |> Seq.map snd |> Seq.toArray
+        let cellType, getter = 
+            let cellValue = if forcestring then box "" else (columnSeq |> Seq.head |> getCell 1)
+            propertyImplementation columnSeq cellValue
+        (columnName, (columnSeq, cellType, getter)))
 
 // Simple type wrapping Excel data
 type ExcelFileInternal(filename, range) =
 
-    let data =
+    let data, columns =
         let view = openWorkbookView filename range
         let columns = [for (columnName, (columnIndex, _, _)) in getColumnDefinitions view true -> columnName, columnIndex] |> Map.ofList
-        let buildRow rowIndex = new Row(rowIndex, getCellValue view, columns)
-        seq{ 1 .. view.RowCount}
-        |> Seq.map buildRow
+        let buildRow rowIndex = new Row(rowIndex, getCellValue view, columns)        
+        seq { 1 .. view.RowCount} |> Seq.map buildRow, seq { 0 .. view.ColumnMappings.Count - 1 } |> Seq.map (getCellValue view 0 >> string)
 
     member __.Data = data
+    member __.Columns = columns
 
 type internal GlobalSingleton private () =
     static let mutable instance = Dictionary<_, _>()
@@ -144,11 +156,11 @@ let internal typExcel(cfg:TypeProviderConfig) =
 
             // add one property per Excel field
             let columnProperties = getColumnDefinitions data forcestring
-            for (columnName, (columnIndex, propertyType, getter)) in columnProperties do
+            for (columnName, (columnSeq, propertyType, getter)) in columnProperties do
 
                 let prop = ProvidedProperty(columnName, propertyType, GetterCode = getter)
                 // Add metadata defining the property's location in the referenced file
-                prop.AddDefinitionLocation(1, columnIndex, filename)
+                prop.AddDefinitionLocation(1, columnSeq |> Seq.head, filename)
                 providedRowType.AddMember(prop)
 
             // define the provided type, erasing to an seq<int -> obj>
@@ -160,8 +172,11 @@ let internal typExcel(cfg:TypeProviderConfig) =
             // add a constructor taking the filename to load
             providedExcelFileType.AddMember(ProvidedConstructor([ProvidedParameter("filename", typeof<string>)], InvokeCode = singleItemOrFail (fun filename -> <@@ ExcelFileInternal(%%filename, range) @@>)))
 
+            providedExcelFileType.AddMember(ProvidedConstructor([ProvidedParameter("filename", typeof<string>); ProvidedParameter("range", typeof<string>)], 
+                                                                InvokeCode = fun [filename; range] -> <@@ ExcelFileInternal(%%filename, %%range) @@>))
+
             // add a new, more strongly typed Data property (which uses the existing property at runtime)
-            providedExcelFileType.AddMember(ProvidedProperty("Data", typedefof<seq<_>>.MakeGenericType(providedRowType), GetterCode = singleItemOrFail (fun excFile -> <@@ (%%excFile:ExcelFileInternal).Data @@>)))
+            providedExcelFileType.AddMember(ProvidedProperty("Data", typedefof<seq<_>>.MakeGenericType(providedRowType), GetterCode = fun [excFile] -> <@@ (%%excFile:ExcelFileInternal).Data @@>))
 
             // add the row type as a nested type
             providedExcelFileType.AddMember(providedRowType)
